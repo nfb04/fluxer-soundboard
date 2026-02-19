@@ -167,7 +167,6 @@ loadSoundsConfig();
 
 const isPlaying = new Map();
 const soundDurations = new Map();
-const voiceSessions = new Map();
 
 // ============================================================
 // HELPERS
@@ -454,89 +453,29 @@ async function setupSoundboard(guildId, guildName) {
   }
 }
 
-async function dumpVoiceSessions(guildId, botChannelId) {
-  const sessions = voiceSessions.get(guildId);
-  log(`  Bot channel ID: ${botChannelId}`);
-  log(`  Tracked sessions: ${sessions ? sessions.size : 0}`);
-
-  if (!sessions || sessions.size === 0) {
-    log('  (no sessions tracked)');
-    return;
+/** Actual users (excluding bot) in channel from gateway voice state. Source of truth for leave decision. */
+function getActualUserCountInChannel(guildId, channelId) {
+  const guildVoiceStates = voiceManager.voiceStates?.get(guildId);
+  if (!guildVoiceStates) return 0;
+  let count = 0;
+  for (const [userId, chId] of guildVoiceStates) {
+    if (userId === client.user.id) continue;
+    if (chId === channelId) count++;
   }
-
-  for (const [sessionId, { userId, channelId }] of sessions) {
-    let username = 'unknown';
-    try {
-      const userData = await client.rest.get(`/users/${userId}`);
-      username = userData.global_name || userData.username || 'unknown';
-    } catch (e) {
-      // Ignore
-    }
-    const isThisBot = userId === client.user.id;
-    log(`  - session: ${sessionId} | user: ${username} (${userId}) | channel: ${channelId} | isBot: ${isThisBot}`);
-  }
+  return count;
 }
 
 async function checkAndLeaveIfEmpty(guildId, botChannelId) {
-  const sessions = voiceSessions.get(guildId);
+  const actualCount = getActualUserCountInChannel(guildId, botChannelId);
 
-  let userCount = 0;
-  if (sessions) {
-    for (const [key, data] of sessions) {
-      if (data.channelId !== botChannelId) continue;
-      if (data.userId === client.user.id) continue;
+  log(`checkAndLeaveIfEmpty: ${actualCount} user(s) in channel`);
 
-      if (key.startsWith('unknown_count_')) {
-        userCount += data.count;
-      } else {
-        userCount++;
-      }
-    }
-  }
-
-  log(`checkAndLeaveIfEmpty: ${userCount} active session(s) in bot's channel`);
-
-  if (userCount === 0) {
-    log('\n=== LEAVING - session dump ===');
-    await dumpVoiceSessions(guildId, botChannelId);
-    log('=== END DUMP ===\n');
-
+  if (actualCount === 0) {
     log('No users left, leaving voice channel...');
     voiceManager.leave(guildId);
     isPlaying.delete(guildId);
   } else {
-    log(`${userCount} session(s) still in channel, staying`);
-  }
-}
-
-function syncSessionsFromVoiceStates(guildId, botChannelId) {
-  const guildVoiceStates = voiceManager.voiceStates?.get(guildId);
-  if (!guildVoiceStates) return;
-
-  if (!voiceSessions.has(guildId)) {
-    voiceSessions.set(guildId, new Map());
-  }
-
-  const sessions = voiceSessions.get(guildId);
-
-  for (const [userId, channelId] of guildVoiceStates) {
-    if (userId === client.user.id) continue;
-    if (!channelId) continue;
-
-    const hasRealSession = Array.from(sessions.entries()).some(
-      ([key, data]) => !key.startsWith('unknown_count_') && data.userId === userId
-    );
-
-    if (hasRealSession) {
-      log(`  User ${userId} already has real session(s), skipping unknown counter`);
-      continue;
-    }
-
-    const countKey = `unknown_count_${userId}`;
-    if (!sessions.has(countKey)) {
-      sessions.set(countKey, { userId, channelId, count: 1 });
-      log(`  Synced unknown session counter for userId ${userId} in channel ${channelId} (count: 1)`);
-    }
+    log(`Staying: ${actualCount} user(s) still in channel`);
   }
 }
 
@@ -864,19 +803,11 @@ client.on(Events.Ready, safeHandler(async () => {
           const botChannelId = voiceManager.getVoiceChannelId(guildId, client.user.id);
           if (!botChannelId) continue;
 
-          const sessions = voiceSessions.get(guildId) || new Map();
+          const actualCount = getActualUserCountInChannel(guildId, botChannelId);
+          log(`[30s check] Guild ${guildId}: ${actualCount} user(s) in bot's channel`);
 
-          let userCount = 0;
-          for (const [sessionId, { userId, channelId }] of sessions) {
-            if (channelId !== botChannelId) continue;
-            if (userId === client.user.id) continue;
-            userCount++;
-          }
-
-          log(`[30s check] Guild ${guildId}: ${userCount} active session(s) in bot's channel`);
-
-          if (userCount === 0) {
-            log(`Channel is empty, leaving...`);
+          if (actualCount === 0) {
+            log('Channel is empty, leaving...');
             voiceManager.leave(guildId);
             isPlaying.delete(guildId);
           }
@@ -889,43 +820,15 @@ client.on(Events.Ready, safeHandler(async () => {
 }));
 
 client.on(Events.VoiceStateUpdate, safeHandler(async (voiceState) => {
-  const { guild_id, user_id, session_id, channel_id } = voiceState;
+  const { guild_id, user_id, channel_id } = voiceState;
 
   if (user_id === client.user.id) return;
-
-  if (!voiceSessions.has(guild_id)) {
-    voiceSessions.set(guild_id, new Map());
-  }
-  const sessions = voiceSessions.get(guild_id);
-
-  if (channel_id === null) {
-    const hadRealSession = sessions.has(session_id);
-    sessions.delete(session_id);
-
-    if (!hadRealSession) {
-      const countKey = `unknown_count_${user_id}`;
-      const current = sessions.get(countKey)?.count || 0;
-      if (current <= 1) {
-        sessions.delete(countKey);
-        log(`Unknown session ended for user ${user_id}, counter removed`);
-      } else {
-        sessions.set(countKey, { userId: user_id, count: current - 1, channelId: sessions.get(countKey).channelId });
-        log(`Unknown session ended for user ${user_id}, counter now ${current - 1}`);
-      }
-    }
-
-    log(`Session ended: ${session_id} (user: ${user_id}), ${sessions.size} session(s) remaining`);
-  } else {
-    sessions.set(session_id, { userId: user_id, channelId: channel_id });
-  }
-
   if (channel_id !== null) return;
 
   const botVoiceChannelId = voiceManager.getVoiceChannelId(guild_id, client.user.id);
   if (!botVoiceChannelId) return;
 
   await new Promise(resolve => setTimeout(resolve, 500));
-
   await checkAndLeaveIfEmpty(guild_id, botVoiceChannelId);
 }));
 
@@ -1003,8 +906,6 @@ client.on(Events.MessageReactionAdd, safeHandler(async (reaction, user, messageI
     log(`Playing ${sound.name}`);
 
     const connection = await voiceManager.join(voiceChannel);
-
-    syncSessionsFromVoiceStates(guildId, voiceChannelId);
 
     await new Promise(resolve => setTimeout(resolve, 200));
 
