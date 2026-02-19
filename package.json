@@ -1,0 +1,12 @@
+{
+  "name": "fluxer-soundboard",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "dependencies": {
+    "@fluxerjs/core": "^1.1.9",
+    "@fluxerjs/voice": "^1.1.9",
+    "dotenv": "^17.3.1",
+    "node-emoji": "^2.2.0"
+  }
+}

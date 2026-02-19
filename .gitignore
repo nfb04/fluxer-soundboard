@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Secrets – never commit
+.env
+.env.local
+.env.*.local
+
+# Runtime / local state
+sounds-config.json
+sounds/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
+*.swp
+*.swo
