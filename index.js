@@ -30,6 +30,7 @@ const RECONNECT_DELAYS_MS = [10_000, 20_000, 30_000, 60_000, 60_000]; // then ke
 const KEEPALIVE_INTERVAL_MS = 60_000; // check REST connectivity every 60s
 let reconnecting = false;
 let keepaliveInterval = null;
+let voiceCheckInterval = null;
 const MAX_SOUND_FILE_BYTES = 5 * 1024 * 1024; // 5 MB
 const MAX_SOUND_DURATION_SEC = 25;
 const ALLOWED_AUDIO_EXT = /\.(mp3|wav|ogg|m4a|aac|flac|webm)$/i;
@@ -855,34 +856,36 @@ client.on(Events.Ready, safeHandler(async () => {
 
   log('All soundboards posted!');
 
-  // Backup check every 30 seconds
-  setInterval(async () => {
-    try {
-      for (const [guildId] of client.guilds) {
-        const botChannelId = voiceManager.getVoiceChannelId(guildId, client.user.id);
-        if (!botChannelId) continue;
+  // Backup check every 30 seconds (only start once, Ready can fire multiple times on reconnect)
+  if (!voiceCheckInterval) {
+    voiceCheckInterval = setInterval(async () => {
+      try {
+        for (const [guildId] of client.guilds) {
+          const botChannelId = voiceManager.getVoiceChannelId(guildId, client.user.id);
+          if (!botChannelId) continue;
 
-        const sessions = voiceSessions.get(guildId) || new Map();
+          const sessions = voiceSessions.get(guildId) || new Map();
 
-        let userCount = 0;
-        for (const [sessionId, { userId, channelId }] of sessions) {
-          if (channelId !== botChannelId) continue;
-          if (userId === client.user.id) continue;
-          userCount++;
+          let userCount = 0;
+          for (const [sessionId, { userId, channelId }] of sessions) {
+            if (channelId !== botChannelId) continue;
+            if (userId === client.user.id) continue;
+            userCount++;
+          }
+
+          log(`[30s check] Guild ${guildId}: ${userCount} active session(s) in bot's channel`);
+
+          if (userCount === 0) {
+            log(`Channel is empty, leaving...`);
+            voiceManager.leave(guildId);
+            isPlaying.delete(guildId);
+          }
         }
-
-        log(`[30s check] Guild ${guildId}: ${userCount} active session(s) in bot's channel`);
-
-        if (userCount === 0) {
-          log(`Channel is empty, leaving...`);
-          voiceManager.leave(guildId);
-          isPlaying.delete(guildId);
-        }
+      } catch (err) {
+        logError('[30s check error]', err?.message);
       }
-    } catch (err) {
-      logError('[30s check error]', err?.message);
-    }
-  }, 30000);
+    }, 30000);
+  }
 }));
 
 client.on(Events.VoiceStateUpdate, safeHandler(async (voiceState) => {
