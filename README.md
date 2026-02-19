@@ -163,7 +163,7 @@ On first run the bot will create `sounds-config.json` (empty by default). Add so
 
 ## Disclaimer
 This is an early version. It works fairly stable for me but Fluxer / fluxerjs is updating frequently and things could break at any time.
-I dont know how active I will maintain the bot, but feel free to use it as a base for your own implementation. Hopefully we get a native soundboard from Fluxer at some point!
+This project is provided as-is. I may update it occasionally, but I do not guarantee support or active maintenance. Hopefully we get a native soundboard from Fluxer at some point!
 
 ## AI Disclaimer
 This bot was mostly vibe-coded in Cursor. I dont know JS very well and there will surely be better implementations. Nobody is forcing you to use it :)
