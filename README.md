@@ -171,5 +171,5 @@ This bot was mostly vibe-coded in Cursor. I dont know JS very well and there wil
 Feel free to contact me on Fluxer: nfb#0000
 
 ## License
-
-Use and modify as you like; no warranty.
+MIT
+(Use and modify as you like; no warranty.)
