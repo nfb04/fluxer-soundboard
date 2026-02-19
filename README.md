@@ -167,6 +167,7 @@ This project is provided as-is. I may update it occasionally, but I do not guara
 
 ## AI Disclaimer
 This bot was mostly vibe-coded in Cursor. I dont know JS very well and there will surely be better implementations. Nobody is forcing you to use it :)
+I just needed a soundboard, couldnt find one, so I made one.
 
 Feel free to contact me on Fluxer: nfb#0000
 
