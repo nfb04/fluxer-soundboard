@@ -832,17 +832,18 @@ client.on(Events.VoiceStateUpdate, safeHandler(async (voiceState) => {
   await checkAndLeaveIfEmpty(guild_id, botVoiceChannelId);
 }));
 
-client.on(Events.MessageReactionAdd, safeHandler(async (reaction, user, messageId, channelId, emoji, userId) => {
-  const reactingUserId =
-    (typeof userId === 'string' && userId) ||
-    (typeof user === 'object' && user?.id) ||
-    (typeof user === 'string' && user) ||
-    null;
+// v1.2.1: MessageReactionAdd emits (reaction, user) only; messageId/channelId/emoji/userId on reaction/user
+client.on(Events.MessageReactionAdd, safeHandler(async (reaction, user) => {
+  const reactingUserId = user?.id ?? null;
 
   if (!reactingUserId) return;
   if (reactingUserId === client.user.id) return;
 
-  // Fluxer: emojiIdentifier is unicode (e.g. 🥸) or "name:id" for custom
+  const channelId = reaction.channelId;
+  const messageId = reaction.messageId;
+  const emoji = reaction.emoji;
+
+  // Fluxer: emojiIdentifier is unicode (e.g. 🥸) or "name:id" for custom (GatewayReactionEmoji.id is optional)
   const emojiIdentifier =
     reaction?.emojiIdentifier ||
     (emoji?.id ? `${emoji.name}:${emoji.id}` : emoji?.name);
@@ -851,7 +852,7 @@ client.on(Events.MessageReactionAdd, safeHandler(async (reaction, user, messageI
   const emojiName = emoji?.name ?? reaction?.emoji?.name;
   const emojiId = emoji?.id ?? reaction?.emoji?.id;
   const primaryKey = emojiId ? `${emojiName}:${emojiId}` : emojiName;
-  
+
   const sound =
     (emojiIdentifier && SOUNDS[emojiIdentifier]) ||
     (primaryKey && SOUNDS[primaryKey]) ||
