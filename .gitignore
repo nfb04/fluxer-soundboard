@@ -8,6 +8,7 @@ node_modules/
 
 # Runtime / local state
 sounds-config.json
+soundboard-roles-config.json
 sounds/
 
 # OS / editor

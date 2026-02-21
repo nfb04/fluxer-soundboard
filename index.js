@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Client, Events, EmbedBuilder, Routes } from '@fluxerjs/core';
+import { Client, Events, EmbedBuilder, Routes, PermissionFlags } from '@fluxerjs/core';
 import { getVoiceManager } from '@fluxerjs/voice';
 import * as nodeEmoji from 'node-emoji';
 import { fileURLToPath } from 'url';
@@ -26,6 +26,8 @@ const __dirname = dirname(__filename);
 
 // Path to sounds config file (persistent storage)
 const SOUNDS_CONFIG_PATH = join(__dirname, 'sounds-config.json');
+// Path to soundboard role config: which roles can add/remove sounds (per guild). Restart-safe.
+const ROLES_CONFIG_PATH = join(__dirname, 'soundboard-roles-config.json');
 const RECONNECT_DELAYS_MS = [10_000, 20_000, 30_000, 60_000, 60_000]; // then keeps 60s
 const KEEPALIVE_INTERVAL_MS = 60_000; // check REST connectivity every 60s
 let reconnecting = false;
@@ -34,7 +36,7 @@ let voiceCheckInterval = null;
 const MAX_SOUND_FILE_BYTES = 5 * 1024 * 1024; // 5 MB
 const MAX_SOUND_DURATION_SEC = 25;
 const ALLOWED_AUDIO_EXT = /\.(mp3|wav|ogg|m4a|aac|flac|webm)$/i;
-// Optional: shortcode name -> unicode for emojis not in node-emoji (e.g. Fluxer/Discord shortcodes)
+// Optional: shortcode name -> unicode for emojis not in node-emoji (e.g. Fluxer shortcodes)
 const EMOJI_SHORTCODES_PATH = join(__dirname, 'emoji-shortcodes.json');
 
 let loadedShortcodes = null;
@@ -162,8 +164,67 @@ function saveSoundsConfig() {
   }
 }
 
+// ============================================================
+// SOUNDBOARD ROLES CONFIG - Which roles can add/remove sounds (per guild)
+// Only users with Manage Guild can change this config.
+// ============================================================
+/** guildId -> array of role IDs allowed to add/remove sounds */
+let ROLES_CONFIG = {};
+
+function loadRolesConfig() {
+  if (existsSync(ROLES_CONFIG_PATH)) {
+    try {
+      const data = readFileSync(ROLES_CONFIG_PATH, 'utf8');
+      const raw = JSON.parse(data);
+      ROLES_CONFIG = typeof raw === 'object' && raw !== null ? raw : {};
+      log(`Loaded roles config for ${Object.keys(ROLES_CONFIG).length} guild(s)`);
+    } catch (error) {
+      logError('Error loading roles config:', error.message);
+      ROLES_CONFIG = {};
+    }
+  } else {
+    ROLES_CONFIG = {};
+  }
+}
+
+function saveRolesConfig() {
+  try {
+    writeFileSync(ROLES_CONFIG_PATH, JSON.stringify(ROLES_CONFIG, null, 2));
+    log('Roles config saved');
+  } catch (error) {
+    logError('Error saving roles config:', error.message);
+  }
+}
+
+function getAllowedRoleIds(guildId) {
+  if (!guildId) return [];
+  const list = ROLES_CONFIG[guildId];
+  return Array.isArray(list) ? [...list] : [];
+}
+
+function setAllowedRoleIds(guildId, roleIds) {
+  if (!guildId) return;
+  ROLES_CONFIG[guildId] = Array.isArray(roleIds) ? roleIds : [];
+  saveRolesConfig();
+}
+
+function addAllowedRole(guildId, roleId) {
+  const list = getAllowedRoleIds(guildId);
+  if (list.includes(roleId)) return false;
+  list.push(roleId);
+  setAllowedRoleIds(guildId, list);
+  return true;
+}
+
+function removeAllowedRole(guildId, roleId) {
+  const list = getAllowedRoleIds(guildId).filter((id) => id !== roleId);
+  setAllowedRoleIds(guildId, list);
+  return true;
+}
+
 // Initialize
 loadSoundsConfig();
+loadRolesConfig();
 
 const isPlaying = new Map();
 const soundDurations = new Map();
@@ -171,6 +232,30 @@ const soundDurations = new Map();
 // ============================================================
 // HELPERS
 // ============================================================
+
+/** Resolve the author of the message as a guild member (null in DMs or if not in guild). */
+async function getMessageMember(message) {
+  if (!message.guildId) return null;
+  const guild = await message.resolveGuild();
+  if (!guild) return null;
+  return guild.members.resolve(message.author.id);
+}
+
+/** True if the member can change soundboard role config (Manage Guild permission). */
+function canConfigureRoles(member) {
+  return member && member.permissions && member.permissions.has(PermissionFlags.ManageGuild);
+}
+
+/** True if the member can add/remove sounds: has Manage Guild or has one of the allowed roles. */
+function canManageSoundboard(member, guildId) {
+  if (!member) return false;
+  if (member.permissions && member.permissions.has(PermissionFlags.ManageGuild)) return true;
+  const allowed = getAllowedRoleIds(guildId);
+  if (allowed.length === 0) return false;
+  const cache = member.roles?.cache;
+  if (!cache) return false;
+  return allowed.some((roleId) => cache.has(roleId));
+}
 
 function displayEmojiForEmbed(key, animated = false) {
   const s = String(key ?? '');
@@ -291,11 +376,7 @@ function buildEmbedDescription() {
     .map(([emoji, sound]) => `${displayEmojiForEmbed(emoji, sound.animated)} ${sound.name}`)
     .join('\n');
 
-  return `**React to play sounds**\n\n${soundList}\n\n` +
-    '`!leave` - Make bot leave voice channel\n' +
-    '`!soundboard reload` - Reload soundboard\n' +
-    '`!soundboard add "<name>" <emoji>` - Add sound (attach audio)\n' +
-    '`!soundboard remove <emoji>` - Remove sound';
+  return `**React to play sounds**\n\n${soundList || '_No sounds yet._'}`;
 }
 
 function buildEmbed() {
@@ -543,9 +624,18 @@ client.on(Events.MessageCreate, safeHandler(async (message) => {
 
   const content = message.content.trim();
 
-  // !leave command
-  if (content === '!leave') {
+  // !soundboard leave command — requires Manage Server or configured role
+  if (content === '!soundboard leave') {
     const guildId = message.guildId;
+    if (!guildId) {
+      await message.reply('❌ This command can only be used in a server.');
+      return;
+    }
+    const member = await getMessageMember(message);
+    if (!canManageSoundboard(member, guildId)) {
+      await message.reply('❌ You don\'t have permission. You need **Manage Server** or a role configured with `!soundboard config role add`.');
+      return;
+    }
     const botVoiceChannelId = voiceManager.getVoiceChannelId(guildId, client.user.id);
 
     if (botVoiceChannelId) {
@@ -558,9 +648,18 @@ client.on(Events.MessageCreate, safeHandler(async (message) => {
     return;
   }
 
-  // !soundboard reload command
+  // !soundboard reload command — requires Manage Server or configured role
   if (content === '!soundboard reload' || content === '!soundboard_reload') {
     const guildId = message.guildId;
+    if (!guildId) {
+      await message.reply('❌ This command can only be used in a server.');
+      return;
+    }
+    const member = await getMessageMember(message);
+    if (!canManageSoundboard(member, guildId)) {
+      await message.reply('❌ You don\'t have permission. You need **Manage Server** or a role configured with `!soundboard config role add`.');
+      return;
+    }
     const guild = client.guilds.get(guildId);
 
     if (!guild) {
@@ -599,8 +698,92 @@ client.on(Events.MessageCreate, safeHandler(async (message) => {
     return;
   }
 
+  // !soundboard config role add/remove/list — requires Manage Guild
+  if (content.startsWith('!soundboard config role ')) {
+    const guildId = message.guildId;
+    if (!guildId) {
+      await message.reply('❌ This command can only be used in a server.');
+      return;
+    }
+    const guild = await message.resolveGuild();
+    if (!guild) {
+      await message.reply('❌ Could not find this server.');
+      return;
+    }
+    const member = await getMessageMember(message);
+    if (!member) {
+      await message.reply('❌ Could not resolve your member data.');
+      return;
+    }
+    if (!canConfigureRoles(member)) {
+      await message.reply('❌ You need the **Manage Server** permission to change soundboard role config.');
+      return;
+    }
+
+    const rest = content.slice('!soundboard config role '.length).trim();
+    const subParts = rest.split(/\s+/);
+    const subCmd = subParts[0]?.toLowerCase();
+
+    if (subCmd === 'add' && subParts.length >= 2) {
+      const roleArg = subParts.slice(1).join(' ').trim();
+      const roleId = /^\d+$/.test(roleArg) ? roleArg : null;
+      const role = roleId ? guild.roles.get(roleId) : Array.from(guild.roles.values()).find((r) => r.name.toLowerCase() === roleArg.toLowerCase());
+      if (!role) {
+        await message.reply(`❌ Role not found: \`${roleArg}\`. Use a role name or role ID.`);
+        return;
+      }
+      const added = addAllowedRole(guildId, role.id);
+      if (added) {
+        await message.reply(`✅ Role ${role} (\`${role.name}\`) can now add and remove sounds.`);
+      } else {
+        await message.reply(`ℹ️ Role ${role} was already allowed.`);
+      }
+      return;
+    }
+
+    if (subCmd === 'remove' && subParts.length >= 2) {
+      const roleArg = subParts.slice(1).join(' ').trim();
+      const roleId = /^\d+$/.test(roleArg) ? roleArg : null;
+      const role = roleId ? guild.roles.get(roleId) : Array.from(guild.roles.values()).find((r) => r.name.toLowerCase() === roleArg.toLowerCase());
+      if (!role) {
+        await message.reply(`❌ Role not found: \`${roleArg}\`. Use a role name or role ID.`);
+        return;
+      }
+      removeAllowedRole(guildId, role.id);
+      await message.reply(`✅ Role ${role} (\`${role.name}\`) can no longer add or remove sounds.`);
+      return;
+    }
+
+    if (subCmd === 'list') {
+      const ids = getAllowedRoleIds(guildId);
+      if (ids.length === 0) {
+        await message.reply('No roles are configured. Only users with **Manage Server** can add/remove sounds. Use `!soundboard config role add <role>` to add one.');
+        return;
+      }
+      const roles = ids.map((id) => guild.roles.get(id)).filter(Boolean);
+      const names = roles.map((r) => `${r} (\`${r.name}\`)`).join(', ');
+      await message.reply(`Roles that can add/remove sounds: ${names || '(none)'}`);
+      return;
+    }
+
+    await message.reply(
+      '❌ Usage: `!soundboard config role add <role name or ID>` | `remove <role>` | `list`'
+    );
+    return;
+  }
+
   // !soundboard remove <emoji>
   if (content.startsWith('!soundboard remove ')) {
+    const guildId = message.guildId;
+    if (!guildId) {
+      await message.reply('❌ This command can only be used in a server.');
+      return;
+    }
+    const member = await getMessageMember(message);
+    if (!canManageSoundboard(member, guildId)) {
+      await message.reply('❌ You don\'t have permission to remove sounds. You need **Manage Server** or a role configured with `!soundboard config role add`.');
+      return;
+    }
     const emojiInput = content.slice('!soundboard remove '.length).trim();
     if (!emojiInput) {
       await message.reply('❌ Usage: `!soundboard remove <emoji>` (e.g. `!soundboard remove 🎵` or `!soundboard remove :test:`)');
@@ -636,6 +819,16 @@ client.on(Events.MessageCreate, safeHandler(async (message) => {
 
   // !soundboard add "<name>" <emoji> command (with audio attachment)
   if (content.startsWith('!soundboard add ')) {
+    const guildId = message.guildId;
+    if (!guildId) {
+      await message.reply('❌ This command can only be used in a server.');
+      return;
+    }
+    const member = await getMessageMember(message);
+    if (!canManageSoundboard(member, guildId)) {
+      await message.reply('❌ You don\'t have permission to add sounds. You need **Manage Server** or a role configured with `!soundboard config role add`.');
+      return;
+    }
     const args = content.slice('!soundboard add '.length).trim();
     const parts = args.match(/^"([^"]+)"\s+(.+)$/);
 
@@ -1039,7 +1232,7 @@ function attachCloseHandler() {
   }
 }
 
-/** Periodic REST check; if we can't reach Discord, force destroy + reconnect. */
+/** Periodic REST check; if we can't reach Fluxer, force destroy + reconnect. This might not be needed as it should reconnect automatically, needs more testing when servers are more stable*/
 async function keepaliveCheck() {
   if (reconnecting) return;
   if (!client.isReady?.()) return;

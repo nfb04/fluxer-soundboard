@@ -9,17 +9,27 @@ A soundboard bot for [Fluxer](https://fluxer.app) that posts a message with reac
 <img width="640" height="653" alt="image" src="https://github.com/user-attachments/assets/8dd86a5f-b682-4b8e-b1e8-4c8266d2d109" />
 
 - Play sounds in voice when users react
-  
-**Commands:**
-- `!leave` — bot leaves the voice channel automatically when there are no users left, but this is a backup for forcing it
-- `!soundboard reload` — reload the soundboard
-- `!soundboard add "Name" <emoji>` — add a sound (with attachment)
 
-<img width="669" height="408" alt="image" src="https://github.com/user-attachments/assets/b14a8b39-6942-4c9c-87dd-ab286121b157" />
-  
-- `!soundboard remove <emoji>` — remove a sound
+### Commands
 
-The bot converts mp3 automatically into webm. I didnt test other formats.
+| Command | Who can use it | Description |
+|--------|----------------|-------------|
+| **React to an emoji** | **Everyone** | Play that sound in the bot’s voice channel (you must be in a voice channel). |
+| `!soundboard leave` | Manage Server **or** configured role | Make the bot leave the voice channel (backup when it doesn’t auto-leave). |
+| `!soundboard reload` | Manage Server **or** configured role | Reload the soundboard message in the channel. |
+| `!soundboard add "Name" <emoji>` | Manage Server **or** configured role | Add a sound; attach an audio file to the message. |
+| `!soundboard remove <emoji>` | Manage Server **or** configured role | Remove a sound from the board. |
+| `!soundboard config role add <role>` | **Manage Server only** | Grant a role permission to use leave/reload/add/remove. `<role>` = role name or ID. |
+| `!soundboard config role remove <role>` | **Manage Server only** | Remove that permission from a role. |
+| `!soundboard config role list` | **Manage Server only** | Show which roles can use leave/reload/add/remove. |
+
+### Who can do what by default
+
+- **Everyone** can **react** to play sounds.
+- **Only users with the “Manage Server” permission** can use `!soundboard leave`, `!soundboard reload`, and add/remove sounds until you configure roles. 
+Once an admin runs `!soundboard config role add <RoleName>`, anyone with that role can use those commands too. Role config is stored in `soundboard-roles-config.json` (restart-safe).
+
+The bot converts audio (e.g. MP3) to WebM automatically. Other formats are supported as per the allowed extensions in the code.
 
 ## Requirements
 
@@ -33,7 +43,7 @@ sudo apt install -y nodejs
 ```bash
 sudo apt install -y ffmpeg
 ```
-- A **Fluxer bot token** (from your Fluxer app / Discord developer portal if using Discord)
+- A **Fluxer bot token**
 
 ## Install
 
@@ -60,7 +70,7 @@ You need a **bot token** from Fluxer before the bot can connect. Steps (may vary
    - Read message history (to see commands and reactions)
    - Add reactions
    - Connect and speak in voice channels
-   - (If you manage channels) Manage Messages (to delete and repost the soundboard message)
+   - Manage Messages (to delete and repost the soundboard message)
 6. **Copy the bot token**. This is your `FLUXER_BOT_TOKEN`.
 7. **Invite the bot** to your server using the invite link from the application (with the same scopes/permissions).
 
@@ -156,7 +166,9 @@ sudo systemctl enable fluxer-soundboard
 sudo systemctl start fluxer-soundboard
 ```
 
-On first run the bot will create `sounds-config.json` (empty by default). Add sounds in-app with:
+On first run the bot will create `sounds-config.json` (empty by default) and, when you use role config, `soundboard-roles-config.json`. Both are listed in `.gitignore` so they are not committed (sounds and permissions stay local).
+
+To add sounds (requires Manage Server or a role granted via `!soundboard config role add`):
 
 `!soundboard add "Sound Name" 😀`  
 (with an audio file attached)
