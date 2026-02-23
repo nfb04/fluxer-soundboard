@@ -38,6 +38,8 @@ const MAX_SOUND_DURATION_SEC = 25;
 const ALLOWED_AUDIO_EXT = /\.(mp3|wav|ogg|m4a|aac|flac|webm)$/i;
 // Optional: shortcode name -> unicode for emojis not in node-emoji (e.g. Fluxer shortcodes)
 const EMOJI_SHORTCODES_PATH = join(__dirname, 'emoji-shortcodes.json');
+// guildId -> soundboard message ID (only reactions on this message trigger sounds)
+const soundboardMessageIds = new Map();
 
 let loadedShortcodes = null;
 function getShortcodeToUnicodeMap() {
@@ -394,6 +396,8 @@ async function postSoundboard(channelId, guildId) {
   const message = await client.channels.send(channelId, {
     embeds: [buildEmbed().toJSON()]
   });
+
+  soundboardMessageIds.set(resolvedGuildId, message.id);
 
   for (const [emoji, sound] of Object.entries(SOUNDS)) {
     try {
@@ -1060,6 +1064,9 @@ client.on(Events.MessageReactionAdd, safeHandler(async (reaction, user) => {
   if (!channel) return;
 
   const guildId = channel.guildId;
+
+  // Only accept reactions on the soundboard message for this guild
+  if (reaction.messageId !== soundboardMessageIds.get(guildId)) return;
 
   const removeReaction = async () => {
     try {
