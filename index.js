@@ -332,6 +332,21 @@ async function isCustomEmojiFromGuild(guildId, emojiKey) {
   }
 }
 
+/** Add bot's reaction to a message by channel/message id (for re-add after clear_emoji removal). */
+async function addBotReactionToMessage(channelId, messageId, emojiRaw, guildId, options = {}) {
+  const segment = options.animated && /^\w+:\d+$/.test(emojiRaw) ? `a:${emojiRaw}` : emojiRaw;
+  const route = buildReactionRoute(channelId, messageId, segment);
+  try {
+    await client.rest.put(route);
+  } catch (err) {
+    if (err?.message?.includes('Invalid form body') && /^\w+:\d+$/.test(emojiRaw) && !segment.startsWith('a:')) {
+      await client.rest.put(buildReactionRoute(channelId, messageId, `a:${emojiRaw}`));
+    } else {
+      throw err;
+    }
+  }
+}
+
 async function reactAsBot(message, emoji, guildId, options = {}) {
   const emojiRaw = await client.resolveEmoji(emoji, guildId ?? message?.guildId ?? undefined);
   // API wants name:id for custom (not <:name:id>). Use as-is for custom; unicode already correct.
@@ -1101,21 +1116,23 @@ client.on(Events.MessageReactionAdd, safeHandler(async (reaction, user) => {
   // Only accept reactions on the soundboard message for this guild
   if (reaction.messageId !== soundboardMessageIds.get(guildId)) return;
 
-  const removeReaction = async () => {
+  const emojiRawForRemoval = emojiIdentifier || primaryKey;
+
+  const removeReaction = async (opts = {}) => {
+    if (reactingUserId === client.user.id) return;
+    if (!emojiRawForRemoval) return;
     try {
-      if (reactingUserId === client.user.id) return;
-      const emojiRaw = emojiIdentifier || primaryKey;
-      if (!emojiRaw) return;
-      const route = `${Routes.channelMessageReaction(channelId, messageId, emojiRaw)}/${reactingUserId}`;
-      await client.rest.delete(route);
+      const baseRoute = Routes.channelMessageReaction(channelId, messageId, emojiRawForRemoval);
+      await client.rest.delete(baseRoute);
+      await addBotReactionToMessage(channelId, messageId, emojiRawForRemoval, guildId, { animated: opts.animated });
     } catch (error) {
-      // Ignore
+      logWarn('[reaction] Remove failed:', error?.message ?? error);
     }
   };
 
   if (isPlaying.get(guildId)) {
     log('Blocked - already playing');
-    await removeReaction();
+    await removeReaction({ animated: sound?.animated });
     return;
   }
 
@@ -1123,7 +1140,7 @@ client.on(Events.MessageReactionAdd, safeHandler(async (reaction, user) => {
 
   if (!voiceChannelId) {
     log('User not in voice');
-    await removeReaction();
+    await removeReaction({ animated: sound?.animated });
     return;
   }
 
@@ -1133,7 +1150,7 @@ client.on(Events.MessageReactionAdd, safeHandler(async (reaction, user) => {
     const voiceChannel = client.channels.get(voiceChannelId);
     if (!voiceChannel) {
       isPlaying.delete(guildId);
-      await removeReaction();
+      await removeReaction({ animated: sound?.animated });
       return;
     }
 
@@ -1167,7 +1184,7 @@ client.on(Events.MessageReactionAdd, safeHandler(async (reaction, user) => {
     logError('Error:', error.message);
   } finally {
     isPlaying.delete(guildId);
-    await removeReaction();
+    await removeReaction({ animated: sound?.animated });
   }
 }));
 
