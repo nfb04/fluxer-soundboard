@@ -105,6 +105,33 @@ Insert your bot token in the env file:
 FLUXER_BOT_TOKEN=your_bot_token_here
 ```
 
+### Self-host mode (custom Fluxer instance)
+
+To run the bot against a **self-hosted Fluxer instance** (different API URL and bot token), use the `self` argument:
+
+```bash
+node index.js self
+```
+
+This loads `FLUXER_BOT_TOKEN` and `API_URL` from **`self-host.txt`** in the project directory (instead of `.env`). Create the file from the example:
+
+```bash
+cp self-host.txt.example self-host.txt
+nano self-host.txt
+```
+
+Set at least:
+- `FLUXER_BOT_TOKEN` – bot token from your self-hosted instance
+- `API_URL` – base URL of the API (e.g. `https://fluxer.exeli.us/api`)
+
+Example `self-host.txt`:
+```
+FLUXER_BOT_TOKEN=your-fluxer-token-from-self-hosted-instance
+API_URL=https://your-self-hosted-fluxer.gg/api
+```
+
+For systemd with self-host mode, set `ExecStart=/usr/bin/node /opt/fluxer-soundboard/index.js self` and use a separate env file or `self-host.txt` in the working directory.
+
 **Systemd** (e.g. `/etc/systemd/system/fluxer-soundboard.service`)
   ```ini
   [Unit]

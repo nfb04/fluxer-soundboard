@@ -5,6 +5,7 @@ node_modules/
 .env
 .env.local
 .env.*.local
+self-host.txt
 
 # Runtime / local state
 sounds-config.json

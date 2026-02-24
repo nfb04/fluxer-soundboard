@@ -10,6 +10,33 @@ import { promisify } from 'util';
 import https from 'https';
 import http from 'http';
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Self-host mode: node index.js self → load FLUXER_BOT_TOKEN and API_URL from self-host.txt
+const SELF_HOST_ARG = 'self';
+const SELF_HOST_FILE = join(__dirname, 'self-host.txt');
+const isSelfHost = process.argv[2] === SELF_HOST_ARG;
+
+if (isSelfHost) {
+  if (!existsSync(SELF_HOST_FILE)) {
+    console.error(`[self-host] Missing ${SELF_HOST_FILE}. Copy from self-host.txt.example and set FLUXER_BOT_TOKEN and API_URL.`);
+    process.exit(1);
+  }
+  const raw = readFileSync(SELF_HOST_FILE, 'utf8');
+  for (const line of raw.split('\n')) {
+    const trimmed = line.replace(/#.*$/, '').trim();
+    if (!trimmed) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const value = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, '');
+    if (key) process.env[key] = value;
+  }
+  if (process.env.API_URL) process.env.API_URL = process.env.API_URL.replace(/\/+$/, '');
+  console.log('[self-host] Loaded config from self-host.txt');
+}
+
 const execAsync = promisify(exec);
 
 // Timestamped logging
@@ -18,11 +45,16 @@ const log = (...args) => console.log(ts(), ...args);
 const logError = (...args) => console.error(ts(), ...args);
 const logWarn = (...args) => console.warn(ts(), ...args);
 
-const client = new Client();
-const voiceManager = getVoiceManager(client);
+// Client options: self-host mode uses custom API URL from process.env.API_URL (set from self-host.txt)
+const clientOptions = { intents: 0 };
+if (isSelfHost && process.env.API_URL) {
+  // @fluxerjs/core may use rest.api or rest.baseURL for the REST base URL
+  clientOptions.rest = { baseURL: process.env.API_URL, api: process.env.API_URL };
+  log('Self-host mode: using API_URL', process.env.API_URL);
+}
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const client = new Client(clientOptions);
+const voiceManager = getVoiceManager(client);
 
 // Path to sounds config file (persistent storage)
 const SOUNDS_CONFIG_PATH = join(__dirname, 'sounds-config.json');
@@ -238,9 +270,10 @@ const soundDurations = new Map();
 /** Resolve the author of the message as a guild member (null in DMs or if not in guild). */
 async function getMessageMember(message) {
   if (!message.guildId) return null;
-  const guild = await message.resolveGuild();
+  const guild = client.guilds.get(message.guildId);
   if (!guild) return null;
-  return guild.members.resolve(message.author.id);
+  const members = guild.members?.cache ?? guild.members;
+  return members?.get?.(message.author.id) ?? members?.resolve?.(message.author.id) ?? null;
 }
 
 /** True if the member can change soundboard role config (Manage Guild permission). */
@@ -709,7 +742,7 @@ client.on(Events.MessageCreate, safeHandler(async (message) => {
       await message.reply('❌ This command can only be used in a server.');
       return;
     }
-    const guild = await message.resolveGuild();
+    const guild = client.guilds.get(guildId);
     if (!guild) {
       await message.reply('❌ Could not find this server.');
       return;
