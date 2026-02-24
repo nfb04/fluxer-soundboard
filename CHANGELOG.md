@@ -1,4 +1,11 @@
 # Changelog
+## [1.0.2] - 2026-02-24
+
+### Added
+
+- **Self-Host** support added
+
+---
 
 ## [1.0.1] - 2026-02-22
 
