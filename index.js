@@ -5,6 +5,27 @@ import * as nodeEmoji from 'node-emoji';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { createReadStream, createWriteStream, writeFileSync, readFileSync, unlinkSync, existsSync, statSync, mkdirSync } from 'fs';
+import { readFile } from 'fs/promises';
+import { Readable } from 'stream';
+
+// Chunk size for preloaded buffer. Pipeline: our stream → prism-media WebmDemuxer → parseOpusPacketBoundaries → OpusDecoder → 10ms AudioFrame (480 samples) → LiveKit captureFrame. Too small (e.g. 2KB) can make the demuxer wait for reads and cause small stalls; ~12KB keeps it fed without one huge burst.
+const VOICE_STREAM_CHUNK_BYTES = 12 * 1024;
+
+/** Create a readable stream from a buffer that pushes data in steady chunks (reduces stutter with LiveKit/WebRTC 20ms-style pipelines). */
+function bufferToChunkedStream(buffer, chunkSize = VOICE_STREAM_CHUNK_BYTES) {
+  return new Readable({
+    read() {
+      if (this.offset === undefined) this.offset = 0;
+      while (this.offset < buffer.length) {
+        const end = Math.min(this.offset + chunkSize, buffer.length);
+        const chunk = buffer.subarray(this.offset, end);
+        this.offset = end;
+        if (!this.push(chunk)) return;
+      }
+      this.push(null);
+    }
+  });
+}
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import https from 'https';
@@ -177,6 +198,23 @@ function loadSoundsConfig() {
   if (!existsSync(soundsDir)) {
     mkdirSync(soundsDir, { recursive: true });
   }
+}
+
+/** Load all sound files into memory (sound.buffer) for stutter-free playback. */
+async function preloadSoundBuffers() {
+  let count = 0;
+  let bytes = 0;
+  for (const [emoji, sound] of Object.entries(SOUNDS)) {
+    if (!sound.path || !existsSync(sound.path)) continue;
+    try {
+      sound.buffer = await readFile(sound.path);
+      count++;
+      bytes += sound.buffer.length;
+    } catch (e) {
+      logWarn(`Could not preload "${sound.name}":`, e?.message);
+    }
+  }
+  if (count > 0) log(`Preloaded ${count} sound(s) into RAM (${(bytes / 1024 / 1024).toFixed(2)} MB)`);
 }
 
 function getDefaultSounds() {
@@ -404,11 +442,13 @@ async function downloadFile(url, destPath) {
   });
 }
 
+// Opus bitrate for soundboard clips (lower = less bandwidth, may reduce stutter; 96k is plenty for short clips)
+const OPUS_BITRATE = '96k';
+
 // Convert audio file to webm using ffmpeg
 async function convertToWebm(inputPath, outputPath) {
   try {
-    // -y forces overwrite so ffmpeg doesn't block waiting for interactive confirmation
-    await execAsync(`ffmpeg -y -i "${inputPath}" -c:a libopus -b:a 128k "${outputPath}"`);
+    await execAsync(`ffmpeg -y -i "${inputPath}" -c:a libopus -b:a ${OPUS_BITRATE} "${outputPath}"`);
     return true;
   } catch (error) {
     logError('Conversion error:', error.message);
@@ -994,6 +1034,11 @@ client.on(Events.MessageCreate, safeHandler(async (message) => {
       if (/^<a:\w+:\d+>$/i.test(String(emojiInput).trim())) {
         SOUNDS[emojiKey].animated = true;
       }
+      try {
+        SOUNDS[emojiKey].buffer = await readFile(webmFile);
+      } catch (e) {
+        logWarn('Could not preload new sound buffer:', e?.message);
+      }
 
       soundDurations.set(emojiKey, duration);
       saveSoundsConfig();
@@ -1025,6 +1070,9 @@ client.on(Events.Ready, safeHandler(async () => {
     soundDurations.set(emoji, duration);
     log(`  ${sound.name}: ${duration.toFixed(2)}s`);
   }
+
+  log('Preloading sound buffers...');
+  await preloadSoundBuffers();
 
   const guildCount = client.guilds?.size ?? 0;
   log(`Guilds in cache: ${guildCount}`);
@@ -1158,11 +1206,14 @@ client.on(Events.MessageReactionAdd, safeHandler(async (reaction, user) => {
 
     const connection = await voiceManager.join(voiceChannel);
 
-    await new Promise(resolve => setTimeout(resolve, 200));
+    await new Promise(resolve => setTimeout(resolve, 500));
 
-    const stream = createReadStream(sound.path);
+    const stream = sound.buffer
+      ? bufferToChunkedStream(sound.buffer)
+      : createReadStream(sound.path, { highWaterMark: 512 * 1024 });
 
-    connection.play(stream).catch(err => {
+    const playResult = connection.play(stream);
+    (playResult && typeof playResult.catch === 'function' ? playResult : Promise.resolve()).catch(err => {
       logError('Play error:', err.message);
     });
 
