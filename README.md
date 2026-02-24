@@ -122,7 +122,7 @@ nano self-host.txt
 
 Set at least:
 - `FLUXER_BOT_TOKEN` – bot token from your self-hosted instance
-- `API_URL` – base URL of the API (e.g. `https://fluxer.exeli.us/api`)
+- `API_URL` – base URL of the API
 
 Example `self-host.txt`:
 ```
