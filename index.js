@@ -94,6 +94,13 @@ const EMOJI_SHORTCODES_PATH = join(__dirname, 'emoji-shortcodes.json');
 // guildId -> soundboard message ID (only reactions on this message trigger sounds)
 const soundboardMessageIds = new Map();
 
+/** Guard: Ready can fire multiple times on reconnect; only run initial soundboard setup once per process. */
+let initialSoundboardSetupDone = false;
+
+/** Dedupe MessageCreate by id so we only handle each message once (avoids double replies from duplicate gateway events or reconnects). */
+const processedMessageIds = new Set();
+const MESSAGE_DEDUPE_TTL_MS = 15_000;
+
 let loadedShortcodes = null;
 function getShortcodeToUnicodeMap() {
   if (loadedShortcodes !== null) return loadedShortcodes;
@@ -714,6 +721,14 @@ client.on(Events.MessageCreate, safeHandler(async (message) => {
   // Ignore bot messages
   if (message.author.bot) return;
 
+  // Dedupe: only handle each message once (gateway can emit duplicate MESSAGE_CREATE e.g. on reconnect)
+  const msgId = message.id;
+  if (msgId && processedMessageIds.has(msgId)) return;
+  if (msgId) {
+    processedMessageIds.add(msgId);
+    setTimeout(() => processedMessageIds.delete(msgId), MESSAGE_DEDUPE_TTL_MS);
+  }
+
   const content = message.content.trim();
 
   // !soundboard leave command — requires Manage Server or configured role
@@ -1063,6 +1078,13 @@ client.on(Events.Ready, safeHandler(async () => {
   if (!keepaliveInterval) {
     keepaliveInterval = setInterval(keepaliveCheck, KEEPALIVE_INTERVAL_MS);
   }
+
+  // Ready can fire multiple times on reconnect; only post soundboards once per process to avoid duplicates
+  if (initialSoundboardSetupDone) {
+    log('Skipping soundboard setup (already done this process).');
+    return;
+  }
+  initialSoundboardSetupDone = true;
 
   log('Loading sound durations...');
   for (const [emoji, sound] of Object.entries(SOUNDS)) {
