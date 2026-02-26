@@ -37,10 +37,16 @@ function bufferToChunkedStream(buffer, chunkSize = VOICE_STREAM_CHUNK_BYTES) {
 }
 
 // --- LiveKit play-from-PCM (decode entire buffer first, like Fluxer in-app soundboard) ---
+//
+// Browser example (zero stutter): Blob → decodeAudioData → AudioBuffer → BufferSource → createMediaStreamDestination()
+// → getAudioTracks()[0] → publishTrack(track). Then source.start(). The track is fed by the BROWSER'S NATIVE
+// audio thread at exact sample rate—no JS in the hot path. Node has no AudioContext/MediaStream; @livekit/rtc-node
+// only offers AudioSource + captureFrame(audioFrame), so we must call captureFrame in a JS loop. Every await
+// yields to the event loop (GC, timers, 30s check), which can delay the next frame and cause stutter.
 const LK_SAMPLE_RATE = 48_000;
 const LK_CHANNELS = 1;
-// 50ms frames = fewer JS↔native round-trips (browser feeds from native thread; we can't, so reduce our loop count)
-const LK_FRAME_SAMPLES = 2400; // 50 ms at 48 kHz (was 480 = 10ms; 5x fewer captureFrame calls)
+// 50ms frames = fewer JS↔native round-trips
+const LK_FRAME_SAMPLES = 2400; // 50 ms at 48 kHz
 
 function parseOpusPacketBoundaries(buffer) {
   if (buffer.length < 2) return null;
@@ -1329,6 +1335,7 @@ client.on(Events.Ready, safeHandler(async () => {
   // Backup check every 30 seconds (only start once, Ready can fire multiple times on reconnect)
   if (!voiceCheckInterval) {
     voiceCheckInterval = setInterval(async () => {
+      if (isPlaying.size > 0) return; // skip while feeding PCM to avoid event-loop stalls and stutter
       try {
         for (const [guildId] of client.guilds) {
           const botChannelId = voiceManager.getVoiceChannelId(guildId, client.user.id);
