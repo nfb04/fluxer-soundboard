@@ -1,6 +1,15 @@
 import 'dotenv/config';
 import { Client, Events, EmbedBuilder, Routes, PermissionFlags } from '@fluxerjs/core';
 import { getVoiceManager } from '@fluxerjs/voice';
+import {
+  AudioSource,
+  AudioFrame,
+  LocalAudioTrack,
+  TrackPublishOptions,
+  TrackSource,
+} from '@livekit/rtc-node';
+import { opus as prismOpus } from 'prism-media';
+import { OpusDecoder } from 'opus-decoder';
 import * as nodeEmoji from 'node-emoji';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -26,6 +35,213 @@ function bufferToChunkedStream(buffer, chunkSize = VOICE_STREAM_CHUNK_BYTES) {
     }
   });
 }
+
+// --- LiveKit play-from-PCM (decode entire buffer first, like Fluxer in-app soundboard) ---
+const LK_SAMPLE_RATE = 48_000;
+const LK_CHANNELS = 1;
+// 50ms frames = fewer JS↔native round-trips (browser feeds from native thread; we can't, so reduce our loop count)
+const LK_FRAME_SAMPLES = 2400; // 50 ms at 48 kHz (was 480 = 10ms; 5x fewer captureFrame calls)
+
+function parseOpusPacketBoundaries(buffer) {
+  if (buffer.length < 2) return null;
+  const toc = buffer[0];
+  const c = toc & 3;
+  const tocSingle = (toc & 252) | 0;
+  if (c === 0) {
+    return { frames: [buffer.subarray(0)], consumed: buffer.length };
+  }
+  if (c === 1) {
+    if (buffer.length < 2) return null;
+    const L1 = buffer[1] + 1;
+    if (buffer.length < 2 + L1) return null;
+    const L2 = buffer.length - 2 - L1;
+    const frame0 = new Uint8Array(1 + L1);
+    frame0[0] = tocSingle;
+    frame0.set(buffer.subarray(2, 2 + L1), 1);
+    const frame1 = new Uint8Array(1 + L2);
+    frame1[0] = tocSingle;
+    frame1.set(buffer.subarray(2 + L1), 1);
+    return { frames: [frame0, frame1], consumed: buffer.length };
+  }
+  if (c === 2) {
+    if (buffer.length < 3) return null;
+    const frameLen = Math.floor((buffer.length - 2) / 2);
+    if (frameLen < 1) return null;
+    const frame0 = new Uint8Array(1 + frameLen);
+    frame0[0] = tocSingle;
+    frame0.set(buffer.subarray(2, 2 + frameLen), 1);
+    const frame1 = new Uint8Array(1 + frameLen);
+    frame1[0] = tocSingle;
+    frame1.set(buffer.subarray(2 + frameLen, 2 + 2 * frameLen), 1);
+    return { frames: [frame0, frame1], consumed: 2 + 2 * frameLen };
+  }
+  if (c === 3) {
+    if (buffer.length < 2) return null;
+    const N = buffer[1];
+    if (N < 1 || N > 255) return null;
+    const numLengthBytes = N - 1;
+    if (buffer.length < 2 + numLengthBytes) return null;
+    const lengths = [];
+    for (let i = 0; i < numLengthBytes; i++) lengths.push(buffer[2 + i] + 1);
+    const headerLen = 2 + numLengthBytes;
+    const sumKnown = lengths.reduce((a, b) => a + b, 0);
+    const lastLen = buffer.length - headerLen - sumKnown;
+    if (lastLen < 0) return null;
+    lengths.push(lastLen);
+    const frames = [];
+    let offset = headerLen;
+    for (let i = 0; i < lengths.length; i++) {
+      const L = lengths[i];
+      if (offset + L > buffer.length) return null;
+      const frame = new Uint8Array(1 + L);
+      frame[0] = tocSingle;
+      frame.set(buffer.subarray(offset, offset + L), 1);
+      frames.push(frame);
+      offset += L;
+    }
+    return { frames, consumed: offset };
+  }
+  return null;
+}
+
+function concatUint8Arrays(a, b) {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a);
+  out.set(b, a.length);
+  return out;
+}
+
+function floatToInt16(float32) {
+  const int16 = new Int16Array(float32.length);
+  for (let i = 0; i < float32.length; i++) {
+    let s = float32[i];
+    if (!Number.isFinite(s)) { int16[i] = 0; continue; }
+    s = Math.max(-1, Math.min(1, s));
+    const scale = s < 0 ? 32768 : 32767;
+    int16[i] = Math.max(-32768, Math.min(32767, Math.round(s * scale)));
+  }
+  return int16;
+}
+
+/** Decode a WebM/Opus buffer to 48kHz mono Int16 PCM (same approach as Fluxer in-app: decode whole file then play). */
+async function decodeWebmOpusToPcm(buffer, logPrefix = '[PCM decode]') {
+  const decoder = new OpusDecoder({ sampleRate: LK_SAMPLE_RATE, channels: LK_CHANNELS });
+  await decoder.ready;
+  const demuxer = new prismOpus.WebmDemuxer();
+  const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+  log(`${logPrefix} input size: ${buf.length} bytes`);
+  const inputStream = Readable.from([buf]);
+  inputStream.pipe(demuxer);
+  const chunks = [];
+  let opusBuffer = new Uint8Array(0);
+  let opusFramesDecoded = 0;
+  const drain = () => {
+    while (opusBuffer.length > 0) {
+      const parsed = parseOpusPacketBoundaries(opusBuffer);
+      if (!parsed) break;
+      opusBuffer = opusBuffer.subarray(parsed.consumed);
+      for (const frame of parsed.frames) {
+        try {
+          const result = decoder.decodeFrame(frame);
+          if (result?.channelData?.[0]?.length) {
+            chunks.push(floatToInt16(result.channelData[0]));
+            opusFramesDecoded++;
+          }
+        } catch (e) {
+          logWarn(`${logPrefix} decodeFrame error:`, e?.message ?? e);
+        }
+      }
+    }
+  };
+  await new Promise((resolve, reject) => {
+    demuxer.on('data', (chunk) => {
+      const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(ArrayBuffer.isView(chunk) ? chunk.buffer : chunk);
+      opusBuffer = concatUint8Arrays(opusBuffer, bytes);
+      drain();
+    });
+    demuxer.on('error', reject);
+    demuxer.on('end', () => {
+      drain();
+      resolve();
+    });
+  });
+  const total = chunks.reduce((acc, c) => acc + c.length, 0);
+  const pcm = new Int16Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    pcm.set(c, offset);
+    offset += c.length;
+  }
+  const durationSec = total / LK_SAMPLE_RATE;
+  const firstSamples = total > 0 ? Array.from(pcm.subarray(0, Math.min(8, pcm.length))) : [];
+  log(`${logPrefix} decoded: ${opusFramesDecoded} Opus frames → ${total} samples (${durationSec.toFixed(2)}s)${firstSamples.length ? `, first 8: [${firstSamples.join(', ')}]` : ''}`);
+  return pcm;
+}
+
+/** Play sound via LiveKit by publishing a track and feeding pre-decoded PCM (smooth, like in-app soundboard). */
+async function playSoundboardSoundLiveKit(connection, sound) {
+  const room = connection.room;
+  if (!room?.isConnected) {
+    throw new Error('LiveKit: not connected');
+  }
+  const logPrefix = `[PCM play ${sound.name}]`;
+  let pcm = sound.pcmBuffer;
+  if (!pcm && sound.buffer) {
+    pcm = await decodeWebmOpusToPcm(sound.buffer, logPrefix);
+    sound.pcmBuffer = pcm;
+  }
+  if (!pcm?.length) {
+    throw new Error('No PCM buffer (sound may not be WebM/Opus or decode failed)');
+  }
+  const source = new AudioSource(LK_SAMPLE_RATE, LK_CHANNELS);
+  const track = LocalAudioTrack.createAudioTrack('soundboard', source);
+  const options = new TrackPublishOptions();
+  options.source = TrackSource.SOURCE_MICROPHONE;
+  await room.localParticipant.publishTrack(track, options);
+  const totalFrames = Math.ceil(pcm.length / LK_FRAME_SAMPLES);
+  log(`${logPrefix} track published, feeding ${totalFrames} frames (${(LK_FRAME_SAMPLES / 48).toFixed(0)}ms each, fewer round-trips)`);
+  await new Promise((r) => setTimeout(r, 50));
+  let offset = 0;
+  let framesSent = 0;
+  const QUEUE_TARGET_MS = 800;
+  const waitForPlayoutWithTimeout = (maxMs = 5000) => {
+    if (typeof source.waitForPlayout !== 'function') return Promise.resolve();
+    return Promise.race([
+      source.waitForPlayout(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('waitForPlayout timeout')), maxMs)),
+    ]).catch(() => {});
+  };
+  try {
+    while (offset < pcm.length) {
+      if ((source.queuedDuration ?? 0) > QUEUE_TARGET_MS) {
+        await waitForPlayoutWithTimeout();
+      }
+      const slice = pcm.subarray(offset, Math.min(offset + LK_FRAME_SAMPLES, pcm.length));
+      offset += slice.length;
+      const samplesThisFrame = slice.length;
+      const frameSamples =
+        samplesThisFrame < LK_FRAME_SAMPLES
+          ? (() => {
+              const pad = new Int16Array(LK_FRAME_SAMPLES);
+              pad.set(slice);
+              return pad;
+            })()
+          : new Int16Array(slice);
+      const samplesPerChannel = frameSamples.length;
+      const audioFrame = new AudioFrame(frameSamples, LK_SAMPLE_RATE, LK_CHANNELS, samplesPerChannel);
+      await source.captureFrame(audioFrame);
+      framesSent++;
+      if (framesSent <= 2 || framesSent % 200 === 0 || framesSent === totalFrames) {
+        log(`${logPrefix} frame ${framesSent}/${totalFrames}, queuedDuration=${(source.queuedDuration ?? 0).toFixed(0)}ms`);
+      }
+    }
+    log(`${logPrefix} done: ${framesSent} frames sent (playout continues from queue)`);
+  } finally {
+    await track.close().catch(() => {});
+    await source.close().catch(() => {});
+  }
+}
+
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import https from 'https';
@@ -1230,26 +1446,40 @@ client.on(Events.MessageReactionAdd, safeHandler(async (reaction, user) => {
 
     await new Promise(resolve => setTimeout(resolve, 500));
 
-    const stream = sound.buffer
-      ? bufferToChunkedStream(sound.buffer)
-      : createReadStream(sound.path, { highWaterMark: 512 * 1024 });
+    // When Fluxer uses LiveKit and we have a preloaded buffer, use pre-decoded PCM for stutter-free playback
+    const useLiveKitPcm = connection.room?.isConnected && sound.buffer;
+    let played = false;
+    if (useLiveKitPcm) {
+      try {
+        if (typeof connection.stop === 'function') await Promise.resolve(connection.stop()).catch(() => {});
+        await playSoundboardSoundLiveKit(connection, sound);
+        played = true;
+      } catch (err) {
+        logError('LiveKit PCM play error, falling back to stream:', err?.message ?? err);
+        delete sound.pcmBuffer;
+      }
+    }
+    if (!played) {
+      log(`Using stream path for ${sound.name} (no LiveKit PCM or fallback)`);
+      const stream = sound.buffer
+        ? bufferToChunkedStream(sound.buffer)
+        : createReadStream(sound.path, { highWaterMark: 512 * 1024 });
 
-    const playResult = connection.play(stream);
-    (playResult && typeof playResult.catch === 'function' ? playResult : Promise.resolve()).catch(err => {
-      logError('Play error:', err.message);
-    });
+      const playResult = connection.play(stream);
+      (playResult && typeof playResult.catch === 'function' ? playResult : Promise.resolve()).catch(err => {
+        logError('Play error:', err.message);
+      });
 
-    // Try multiple key formats to find duration
-    const durationKey = emojiIdentifier || primaryKey || emojiName || (emojiName ? `:${emojiName}:` : null);
-    const duration = 
-      (durationKey && soundDurations.get(durationKey)) ||
-      (emojiName && soundDurations.get(emojiName)) ||
-      (emojiName && soundDurations.get(`:${emojiName}:`)) ||
-      3;
-    const waitTime = (duration * 1000) + 250;
-
-    log(`Waiting ${waitTime}ms for ${sound.name} to finish...`);
-    await new Promise(resolve => setTimeout(resolve, waitTime));
+      const durationKey = emojiIdentifier || primaryKey || emojiName || (emojiName ? `:${emojiName}:` : null);
+      const duration =
+        (durationKey && soundDurations.get(durationKey)) ||
+        (emojiName && soundDurations.get(emojiName)) ||
+        (emojiName && soundDurations.get(`:${emojiName}:`)) ||
+        3;
+      const waitTime = (duration * 1000) + 250;
+      log(`Waiting ${waitTime}ms for ${sound.name} to finish...`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+    }
 
     log(`${sound.name} finished`);
 
@@ -1350,13 +1580,22 @@ async function runReconnectLoop() {
 
 client.on(Events.Disconnect, () => { runReconnectLoop(); });
 
-/** When gateway closes, the library may not emit Disconnect; wire 'close' so we reconnect. */
+/** When gateway closes, the library may not emit Disconnect; wire 'close' so we reconnect. Only one listener per ws (remove before add to avoid leak on reconnect). */
+let lastCloseHandlerWs = null;
+const gatewayCloseHandler = () => {
+  log('Gateway connection closed.');
+  runReconnectLoop();
+};
 function attachCloseHandler() {
   try {
-    client.ws.on('close', () => {
-      log('Gateway connection closed.');
-      runReconnectLoop();
-    });
+    const ws = client.ws;
+    if (!ws) return;
+    if (ws !== lastCloseHandlerWs) {
+      if (lastCloseHandlerWs?.off) lastCloseHandlerWs.off('close', gatewayCloseHandler);
+      lastCloseHandlerWs = ws;
+      ws.on('close', gatewayCloseHandler);
+      if (typeof ws.setMaxListeners === 'function') ws.setMaxListeners(20);
+    }
   } catch (_) {
     // client.ws not available yet
   }
