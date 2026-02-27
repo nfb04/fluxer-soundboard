@@ -323,6 +323,14 @@ let initialSoundboardSetupDone = false;
 const processedMessageIds = new Set();
 const MESSAGE_DEDUPE_TTL_MS = 15_000;
 
+/** Dedupe reaction-add by (channel, message, emoji, user) so one click doesn't trigger multiple plays (gateway can send duplicate MessageReactionAdd). */
+const processedReactionKeys = new Set();
+const REACTION_DEDUPE_TTL_MS = 3_000;
+
+/** Debounce leave-check per guild so multiple VoiceStateUpdates (e.g. many users left) only run one leave. */
+const leaveCheckTimeouts = new Map();
+const LEAVE_CHECK_DELAY_MS = 500;
+
 let loadedShortcodes = null;
 function getShortcodeToUnicodeMap() {
   if (loadedShortcodes !== null) return loadedShortcodes;
@@ -1366,8 +1374,14 @@ client.on(Events.VoiceStateUpdate, safeHandler(async (voiceState) => {
   const botVoiceChannelId = voiceManager.getVoiceChannelId(guild_id, client.user.id);
   if (!botVoiceChannelId) return;
 
-  await new Promise(resolve => setTimeout(resolve, 500));
-  await checkAndLeaveIfEmpty(guild_id, botVoiceChannelId);
+  // Debounce: only run one leave-check per guild after events stop (avoids 10+ "No users left" when many events fire)
+  const existing = leaveCheckTimeouts.get(guild_id);
+  if (existing) clearTimeout(existing);
+  const timeoutId = setTimeout(() => {
+    leaveCheckTimeouts.delete(guild_id);
+    checkAndLeaveIfEmpty(guild_id, botVoiceChannelId);
+  }, LEAVE_CHECK_DELAY_MS);
+  leaveCheckTimeouts.set(guild_id, timeoutId);
 }));
 
 // v1.2.1: MessageReactionAdd emits (reaction, user) only; messageId/channelId/emoji/userId on reaction/user
@@ -1422,6 +1436,15 @@ client.on(Events.MessageReactionAdd, safeHandler(async (reaction, user) => {
       logWarn('[reaction] Remove failed:', error?.message ?? error);
     }
   };
+
+  // Dedupe: gateway can send multiple MessageReactionAdd for one click; only process one play per (message, emoji, user)
+  const reactionKey = `${channelId}:${messageId}:${primaryKey}:${reactingUserId}`;
+  if (processedReactionKeys.has(reactionKey)) {
+    await removeReaction({ animated: sound?.animated });
+    return;
+  }
+  processedReactionKeys.add(reactionKey);
+  setTimeout(() => processedReactionKeys.delete(reactionKey), REACTION_DEDUPE_TTL_MS);
 
   if (isPlaying.get(guildId)) {
     log('Blocked - already playing');
